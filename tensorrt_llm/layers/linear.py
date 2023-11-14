@@ -121,9 +121,11 @@ class Linear(Module):
                                     default_net().plugin_config.gemm_plugin)
 
 
+# 分布式矩阵乘按列分割实现
 ColumnLinear = Linear
 
 
+# 分布式矩阵乘按行分割实现
 class RowLinear(Module):
 
     def __init__(self,

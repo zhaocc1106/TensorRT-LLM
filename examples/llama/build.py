@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import gc
 import json
 import os
 import time
@@ -637,6 +638,7 @@ def build_rank_engine(builder: Builder,
     engine = None
 
     # Network -> Engine
+    gc.collect()
     engine = builder.build_engine(network, builder_config)
     if rank == 0:
         config_path = os.path.join(args.output_dir, 'config.json')

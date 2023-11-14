@@ -15,11 +15,12 @@
 import argparse
 import csv
 import json
+import time
 from pathlib import Path
 
 import numpy as np
 import torch
-from transformers import LlamaTokenizer
+from transformers import AutoTokenizer, LlamaTokenizer
 
 import tensorrt_llm
 from tensorrt_llm.quantization import QuantMode
@@ -193,17 +194,17 @@ def parse_arguments():
 
 
 def generate(
-    max_output_len: int,
-    log_level: str = 'error',
-    engine_dir: str = 'llama_outputs',
-    input_text: str = 'Born in north-east France, Soyer trained as a',
-    input_file: str = None,
-    output_csv: str = None,
-    output_npy: str = None,
-    tokenizer_dir: str = None,
-    num_beams: int = 1,
-    streaming: bool = False,
-    streaming_interval: int = 5,
+        max_output_len: int,
+        log_level: str = 'error',
+        engine_dir: str = 'llama_outputs',
+        input_text: str = 'Born in north-east France, Soyer trained as a',
+        input_file: str = None,
+        output_csv: str = None,
+        output_npy: str = None,
+        tokenizer_dir: str = None,
+        num_beams: int = 1,
+        streaming: bool = False,
+        streaming_interval: int = 5,
 ):
     tensorrt_llm.logger.set_level(log_level)
 
@@ -223,7 +224,10 @@ def generate(
 
     sampling_config = SamplingConfig(end_id=EOS_TOKEN,
                                      pad_id=PAD_TOKEN,
-                                     num_beams=num_beams)
+                                     num_beams=num_beams,
+                                     temperature=1,
+                                     top_k=1,
+                                     top_p=1)
 
     engine_name = get_engine_name('llama', dtype, tp_size, pp_size,
                                   runtime_rank)
@@ -264,6 +268,104 @@ def generate(
                          output_csv, output_npy)
 
 
+def generate_batch(
+        max_output_len: int,
+        log_level: str = 'error',
+        engine_dir: str = 'llama_outputs',
+        input_text: str = 'Born in north-east France, Soyer trained as a',
+        input_file: str = None,
+        output_csv: str = None,
+        output_npy: str = None,
+        tokenizer_dir: str = None,
+        num_beams: int = 1,
+        streaming: bool = False,
+        streaming_interval: int = 5,
+):
+    tensorrt_llm.logger.set_level(log_level)
+
+    engine_dir = Path(engine_dir)
+    config_path = engine_dir / 'config.json'
+    model_config, tp_size, pp_size, dtype = read_config(config_path)
+    world_size = tp_size * pp_size
+
+    runtime_rank = tensorrt_llm.mpi_rank()
+    runtime_mapping = tensorrt_llm.Mapping(world_size,
+                                           runtime_rank,
+                                           tp_size=tp_size,
+                                           pp_size=pp_size)
+    torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
+
+    # tokenizer = LlamaTokenizer.from_pretrained(tokenizer_dir, legacy=False)
+    tokenizer = AutoTokenizer.from_pretrained("/root/autodl-tmp/tensorrt_llm/examples/llama/llama-7b")
+    EOS_TOKEN = tokenizer.eos_token_id
+
+    sampling_config = SamplingConfig(end_id=EOS_TOKEN,
+                                     pad_id=PAD_TOKEN,
+                                     num_beams=num_beams,
+                                     temperature=1,
+                                     top_k=1,
+                                     top_p=1)
+
+    engine_name = get_engine_name('llama', dtype, tp_size, pp_size,
+                                  runtime_rank)
+    serialize_path = engine_dir / engine_name
+    with open(serialize_path, 'rb') as f:
+        engine_buffer = f.read()
+    decoder = tensorrt_llm.runtime.GenerationSession(model_config,
+                                                     engine_buffer,
+                                                     runtime_mapping,
+                                                     debug_mode=False,
+                                                     debug_tensors_to_save=None)
+    if runtime_rank == 0:
+        print(f"Running the {dtype} engine ...")
+
+    time_costs = []
+    speeds = []
+    batch_size = 1
+    input_ids, input_lengths = parse_input(input_text, input_file, tokenizer,
+                                           EOS_TOKEN,
+                                           model_config.remove_input_padding)
+    input_ids = torch.repeat_interleave(input_ids, batch_size, dim=0)
+    input_lengths = torch.repeat_interleave(input_lengths, batch_size, dim=0)
+    input_lengths = input_lengths.unsqueeze(1)
+    print('input_ids shape: {}'.format(input_ids.shape))
+    print('input_lengths shape: {}'.format(input_lengths.shape))
+
+    for i in range(11):
+        begin = time.time()
+
+        max_input_length = torch.max(input_lengths).item()
+        decoder.setup(input_lengths.size(0), max_input_length, max_output_len,
+                      num_beams)
+
+        output_ids = decoder.decode_batch(input_ids, sampling_config)  # (batch_size, num_beams, max_output_len)
+        # print('output_ids shape: {}'.format(output_ids.shape))
+        tokens_count = output_ids.size(-1) * batch_size
+
+        torch.cuda.synchronize()
+
+        if runtime_rank == 0:
+            num_beams = output_ids.size(1)
+            for batch_idx in range(batch_size):
+                for beam in range(num_beams):
+                    output_begin = input_lengths[batch_idx]
+                    outputs = output_ids[batch_idx][beam][output_begin:].tolist()
+                    output_text = tokenizer.decode(outputs)
+
+        end = time.time()
+        time_costs.append(end - begin)
+        speed = tokens_count / time_costs[-1]
+        print('tokens: {}, time taken: {}s, speed: {} tokens/s'.format(tokens_count, time_costs[-1], speed))
+        if i > 0:
+            speeds.append(speed)
+
+    print('average tokens: {}'.format(tokens_count))
+    print('average time taken: {}s'.format(np.mean(time_costs)))
+    print('average speed: {} tokens/s'.format(np.mean(speeds)))
+
+    print('Input: {}\n Output: {}'.format(input_text, output_text))
+
 if __name__ == '__main__':
     args = parse_arguments()
-    generate(**vars(args))
+    # generate(**vars(args))
+    generate_batch(**vars(args))

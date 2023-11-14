@@ -15,6 +15,7 @@
 import argparse
 import csv
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -134,7 +135,7 @@ def ptuning_setup(prompt_table, dtype, hidden_size, tasks, input_ids,
                              dtype=torch.int32,
                              device="cuda")
         assert tasks.shape[
-            0] == num_sequences, "Number of supplied tasks must match input batch size"
+                   0] == num_sequences, "Number of supplied tasks must match input batch size"
     else:
         tasks = torch.zeros([num_sequences]).cuda()
 
@@ -143,7 +144,6 @@ def ptuning_setup(prompt_table, dtype, hidden_size, tasks, input_ids,
 
 def print_output(output_ids, input_lengths, sequence_lengths, tokenizer,
                  output_csv, output_npy):
-
     num_beams = output_ids.size(1)
     if output_csv is None and output_npy is None:
         for batch_idx in range(input_lengths.size(0)):
@@ -155,7 +155,7 @@ def print_output(output_ids, input_lengths, sequence_lengths, tokenizer,
                 output_begin = input_lengths[batch_idx]
                 output_end = sequence_lengths[batch_idx][beam]
                 outputs = output_ids[batch_idx][beam][
-                    output_begin:output_end].tolist()
+                          output_begin:output_end].tolist()
                 output_text = tokenizer.decode(outputs)
                 print(f'Output: \"{output_text}\"')
 
@@ -220,18 +220,18 @@ def parse_arguments():
 
 
 def generate(
-    max_output_len: int,
-    log_level: str = 'error',
-    engine_dir: str = 'gpt_outputs',
-    input_text: str = 'Born in north-east France, Soyer trained as a',
-    input_file: str = None,
-    output_csv: str = None,
-    output_npy: str = None,
-    tokenizer_path: str = 'gpt2',
-    vocab_file=None,
-    num_beams: int = 1,
-    prompt_table: Path = None,
-    tasks: str = None,
+        max_output_len: int,
+        log_level: str = 'error',
+        engine_dir: str = 'gpt_outputs',
+        input_text: str = 'Born in north-east France, Soyer trained as a',
+        input_file: str = None,
+        output_csv: str = None,
+        output_npy: str = None,
+        tokenizer_path: str = 'gpt2',
+        vocab_file=None,
+        num_beams: int = 1,
+        prompt_table: Path = None,
+        tasks: str = None,
 ):
     tensorrt_llm.logger.set_level(log_level)
 
@@ -266,9 +266,13 @@ def generate(
 
     sampling_config = SamplingConfig(end_id=EOS_TOKEN,
                                      pad_id=EOS_TOKEN,
+                                     temperature=1.0,
+                                     top_k=1,
+                                     top_p=1,
                                      num_beams=num_beams)
 
     engine_name = get_engine_name('gpt', dtype, world_size, runtime_rank)
+    print('engine_name: {}'.format(engine_name))
     serialize_path = engine_dir / engine_name
     with open(serialize_path, 'rb') as f:
         engine_buffer = f.read()
@@ -277,38 +281,190 @@ def generate(
                                                      runtime_mapping,
                                                      debug_mode=False)
 
+    time_costs = []
+    speeds = []
+    for i in range(21):
+        begin = time.time()
+        input_ids, input_lengths = parse_input(input_text, input_file, tokenizer,
+                                               EOS_TOKEN,
+                                               model_config.remove_input_padding)
+        print('input_ids shape: {}'.format(input_ids.shape))
+        print('input_lengths shape: {}'.format(input_lengths.shape))
+
+        max_input_length = torch.max(input_lengths).item()
+        decoder.setup(input_lengths.size(0),
+                      max_input_length,
+                      max_output_len,
+                      beam_width=num_beams)
+
+        ptuning_args = [] if not model_config.use_prompt_tuning else ptuning_setup(
+            prompt_table, dtype, model_config.hidden_size, tasks, input_ids,
+            input_lengths, model_config.remove_input_padding)
+
+        outputs = decoder.decode(input_ids,
+                                 input_lengths,
+                                 sampling_config,
+                                 *ptuning_args,
+                                 output_sequence_lengths=True,
+                                 return_dict=True,
+                                 stop_words_list=stop_words_list,
+                                 bad_words_list=bad_words_list)
+        output_ids = outputs['output_ids']
+        sequence_lengths = outputs['sequence_lengths']
+        tokens_count = input_lengths.sum().item() + sequence_lengths.sum().item()
+
+        torch.cuda.synchronize()
+        if runtime_rank == 0:
+            num_beams = output_ids.size(1)
+            if output_csv is None and output_npy is None:
+                for batch_idx in range(input_lengths.size(0)):
+                    for beam in range(num_beams):
+                        output_begin = input_lengths[batch_idx]
+                        output_end = sequence_lengths[batch_idx][beam]
+                        outputs = output_ids[batch_idx][beam][
+                                  output_begin:output_end].tolist()
+                        output_text = tokenizer.decode(outputs)
+
+        end = time.time()
+        time_costs.append(end - begin)
+        speed = tokens_count / time_costs[-1]
+        print('tokens: {}, time taken: {}s, speed: {} tokens/s'.format(tokens_count, time_costs[-1], speed))
+        if i > 0:
+            speeds.append(speed)
+
+    print('average tokens: {}'.format(tokens_count))
+    print('average time taken: {}s'.format(np.mean(time_costs)))
+    print('average speed: {} tokens/s'.format(np.mean(speeds)))
+
+    print('Input: {}\n Output: {}'.format(input_text, output_text))
+    # if runtime_rank == 0:
+    #     print_output(output_ids, input_lengths, sequence_lengths, tokenizer,
+    #                  output_csv, output_npy)
+    #     if model_config.gather_all_token_logits:
+    #         print(outputs['context_logits'])
+
+
+def generate_batch(
+        max_output_len: int,
+        log_level: str = 'error',
+        engine_dir: str = 'gpt_outputs',
+        input_text: str = 'Born in north-east France, Soyer trained as a',
+        input_file: str = None,
+        output_csv: str = None,
+        output_npy: str = None,
+        tokenizer_path: str = 'gpt2',
+        vocab_file=None,
+        num_beams: int = 1,
+        prompt_table: Path = None,
+        tasks: str = None,
+):
+    tensorrt_llm.logger.set_level(log_level)
+
+    engine_dir = Path(engine_dir)
+    config_path = engine_dir / 'config.json'
+    model_config, world_size, dtype, max_input_len = read_config(config_path)
+
+    runtime_rank = tensorrt_llm.mpi_rank()
+    runtime_mapping = tensorrt_llm.Mapping(world_size,
+                                           runtime_rank,
+                                           tp_size=world_size)
+    torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
+
+    if vocab_file is not None:
+        tokenizer = T5Tokenizer(vocab_file=vocab_file)
+        EOS_TOKEN = 50256
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        EOS_TOKEN = tokenizer.eos_token_id
+
+    # # An example to stop generation when the model generate " London" on first sentence, " eventually became" on second sentence
+    # stop_words_list = [[" London"], ["eventually became"]]
+    # stop_words_list = tensorrt_llm.runtime.to_word_list_format(stop_words_list, tokenizer)
+    # stop_words_list = torch.Tensor(stop_words_list).to(torch.int32).to("cuda").contiguous()
+    stop_words_list = None
+
+    # # An example to prevent generating " chef" on first sentence, " eventually" and " chef before" on second sentence
+    # bad_words_list = [[" chef"], [" eventually, chef before"]]
+    # bad_words_list = tensorrt_llm.runtime.to_word_list_format(bad_words_list, tokenizer)
+    # bad_words_list = torch.Tensor(bad_words_list).to(torch.int32).to("cuda").contiguous()
+    bad_words_list = None
+
+    sampling_config = SamplingConfig(end_id=EOS_TOKEN,
+                                     pad_id=EOS_TOKEN,
+                                     temperature=1.0,
+                                     top_k=1,
+                                     top_p=1,
+                                     num_beams=num_beams)
+
+    engine_name = get_engine_name('gpt', dtype, world_size, runtime_rank)
+    print('engine_name: {}'.format(engine_name))
+    serialize_path = engine_dir / engine_name
+    with open(serialize_path, 'rb') as f:
+        engine_buffer = f.read()
+    decoder = tensorrt_llm.runtime.GenerationSession(model_config,
+                                                     engine_buffer,
+                                                     runtime_mapping,
+                                                     debug_mode=False)
+
+    time_costs = []
+    speeds = []
+    batch_size = 8
     input_ids, input_lengths = parse_input(input_text, input_file, tokenizer,
                                            EOS_TOKEN,
                                            model_config.remove_input_padding)
+    input_ids = torch.repeat_interleave(input_ids, batch_size, dim=0)
+    input_lengths = torch.repeat_interleave(input_lengths, batch_size, dim=0)
+    input_lengths = input_lengths.unsqueeze(1)
+    print('input_ids shape: {}'.format(input_ids.shape))
+    print('input_lengths shape: {}'.format(input_lengths.shape))
 
-    max_input_length = torch.max(input_lengths).item()
-    decoder.setup(input_lengths.size(0),
-                  max_input_length,
-                  max_output_len,
-                  beam_width=num_beams)
+    for i in range(21):
+        begin = time.time()
 
-    ptuning_args = [] if not model_config.use_prompt_tuning else ptuning_setup(
-        prompt_table, dtype, model_config.hidden_size, tasks, input_ids,
-        input_lengths, model_config.remove_input_padding)
+        max_input_length = torch.max(input_lengths).item()
+        decoder.setup(input_lengths.size(0),
+                      max_input_length,
+                      max_output_len,
+                      beam_width=num_beams)
 
-    outputs = decoder.decode(input_ids,
-                             input_lengths,
-                             sampling_config,
-                             *ptuning_args,
-                             output_sequence_lengths=True,
-                             return_dict=True,
-                             stop_words_list=stop_words_list,
-                             bad_words_list=bad_words_list)
-    output_ids = outputs['output_ids']
-    sequence_lengths = outputs['sequence_lengths']
-    torch.cuda.synchronize()
-    if runtime_rank == 0:
-        print_output(output_ids, input_lengths, sequence_lengths, tokenizer,
-                     output_csv, output_npy)
-        if model_config.gather_all_token_logits:
-            print(outputs['context_logits'])
+        ptuning_args = [] if not model_config.use_prompt_tuning else ptuning_setup(
+            prompt_table, dtype, model_config.hidden_size, tasks, input_ids,
+            input_lengths, model_config.remove_input_padding)
+
+        output_ids = decoder.decode_batch(input_ids, sampling_config)  # (batch_size, num_beams, max_output_len)
+        # print('output_ids shape: {}'.format(output_ids.shape))
+        tokens_count = output_ids.size(-1) * batch_size
+
+        torch.cuda.synchronize()
+
+        if runtime_rank == 0:
+            num_beams = output_ids.size(1)
+            for batch_idx in range(batch_size):
+                for beam in range(num_beams):
+                    output_begin = input_lengths[batch_idx]
+                    outputs = output_ids[batch_idx][beam][output_begin:].tolist()
+                    output_text = tokenizer.decode(outputs)
+
+        end = time.time()
+        time_costs.append(end - begin)
+        speed = tokens_count / time_costs[-1]
+        print('tokens: {}, time taken: {}s, speed: {} tokens/s'.format(tokens_count, time_costs[-1], speed))
+        if i > 0:
+            speeds.append(speed)
+
+    print('average tokens: {}'.format(tokens_count))
+    print('average time taken: {}s'.format(np.mean(time_costs)))
+    print('average speed: {} tokens/s'.format(np.mean(speeds)))
+
+    print('Input: {}\n Output: {}'.format(input_text, output_text))
+    # if runtime_rank == 0:
+    #     print_output(output_ids, input_lengths, sequence_lengths, tokenizer,
+    #                  output_csv, output_npy)
+    #     if model_config.gather_all_token_logits:
+    #         print(outputs['context_logits'])
 
 
 if __name__ == '__main__':
     args = parse_arguments()
-    generate(**vars(args))
+    # generate(**vars(args))
+    generate_batch(**vars(args))

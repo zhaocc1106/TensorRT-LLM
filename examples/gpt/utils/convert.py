@@ -190,6 +190,7 @@ def split_and_save_weight(tp_rank, saved_dir, split_factor, key, vals,
 
     elif "attention.dense.weight" in key or "mlp.dense_4h_to_h.weight" in key:
         cat_dim = 0
+        print('key: {}, vals shape: {}'.format(key, vals[0].shape))
         val = np.concatenate(vals, axis=cat_dim)
         split_vals = np.split(val, split_factor, axis=cat_dim)
         save_split(split_vals, saved_dir, key, tp_rank, split_factor)
@@ -206,6 +207,7 @@ def split_and_save_weight(tp_rank, saved_dir, split_factor, key, vals,
             splits = [np.split(val, 2, axis=-1) for val in vals]
             vals, gates = list(zip(*splits))
         cat_dim = -1
+        print('key: {}, vals shape: {}'.format(key, vals[0].shape))
         val = np.concatenate(vals, axis=cat_dim)
         split_vals = np.split(val, split_factor, axis=cat_dim)
         save_split(split_vals, saved_dir, key, tp_rank, split_factor)
@@ -227,6 +229,7 @@ def split_and_save_weight(tp_rank, saved_dir, split_factor, key, vals,
             save_split(split_vals, saved_dir, key, tp_rank, split_factor)
 
     elif "attention.query_key_value.bias" in key:
+        print('key: {}, vals shape: {}'.format(key, vals[0].shape))
         if local_dim is None:
             local_dim = vals[0].shape[-1] // 3
 
@@ -247,9 +250,11 @@ def split_and_save_weight(tp_rank, saved_dir, split_factor, key, vals,
             vals = [val.reshape(3, local_dim) for val in vals]
             val = np.concatenate(vals, axis=-1)
             split_vals = np.split(val, split_factor, axis=-1)
+        print('key: {}, split_vals shape: {}'.format(key, split_vals[0].shape))
         save_split(split_vals, saved_dir, key, tp_rank, split_factor)
 
     elif "attention.query_key_value.weight" in key:
+        print('key: {}, vals shape: {}'.format(key, vals[0].shape))
         hidden_dim = vals[0].shape[0]
         if local_dim is None:
             local_dim = vals[0].shape[-1] // 3
@@ -275,6 +280,7 @@ def split_and_save_weight(tp_rank, saved_dir, split_factor, key, vals,
             cat_dim = -1
             val = np.concatenate(vals, axis=cat_dim)
             split_vals = np.split(val, split_factor, axis=cat_dim)
+        print('key: {}, split_vals shape: {}'.format(key, split_vals[0].shape))
         save_split(split_vals, saved_dir, key, tp_rank, split_factor)
         if save_int8:
             base_key = key.replace(".weight", "")

@@ -238,6 +238,7 @@ def hf_gpt_converter(args: ProgArgs):
         int8_outputs = "all"
 
     starmap_args = []
+    print('model: {}'.format(model))
     for name, param in model.named_parameters():
         if "weight" not in name and "bias" not in name:
             continue

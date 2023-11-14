@@ -14,6 +14,7 @@
 # limitations under the License.
 import argparse
 import csv
+import time
 from pathlib import Path
 
 import numpy as np
@@ -60,16 +61,16 @@ def parse_arguments():
 
 
 def generate(
-    max_output_len: int,
-    log_level: str = 'error',
-    model_dir: str = 'gpt2',
-    data_type: str = 'fp32',
-    input_text: str = 'Born in north-east France, Soyer trained as a',
-    input_file: str = None,
-    output_csv: str = None,
-    output_npy: str = None,
-    tokenizer_path='gpt2',
-    vocab_file=None,
+        max_output_len: int,
+        log_level: str = 'error',
+        model_dir: str = 'gpt2',
+        data_type: str = 'fp32',
+        input_text: str = 'Born in north-east France, Soyer trained as a',
+        input_file: str = None,
+        output_csv: str = None,
+        output_npy: str = None,
+        tokenizer_path='gpt2',
+        vocab_file=None,
 ):
     tensorrt_llm.logger.set_level(log_level)
 
@@ -86,75 +87,96 @@ def generate(
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         END_ID = tokenizer.eos_token_id
 
-    input_tokens = []
-    if input_file is None:
-        input_tokens.append(
-            tokenizer.encode(input_text, add_special_tokens=False))
-    else:
-        if input_file.endswith('.csv'):
-            with open(input_file, 'r') as csv_file:
-                csv_reader = csv.reader(csv_file, delimiter=',')
-                for line in csv_reader:
-                    input_tokens.append(np.array(line, dtype='int32'))
-        elif input_file.endswith('.npy'):
-            inputs = np.load(input_file)
-            for row in inputs:
-                row = row[row != END_ID]
-                input_tokens.append(row)
+    time_costs = []
+    speeds = []
+    for i in range(1):
+        begin = time.time()
+        input_tokens = []
+        if input_file is None:
+            input_tokens.append(
+                tokenizer.encode(input_text, add_special_tokens=False))
         else:
-            print('Input file format not supported.')
-            raise SystemExit
+            if input_file.endswith('.csv'):
+                with open(input_file, 'r') as csv_file:
+                    csv_reader = csv.reader(csv_file, delimiter=',')
+                    for line in csv_reader:
+                        input_tokens.append(np.array(line, dtype='int32'))
+            elif input_file.endswith('.npy'):
+                inputs = np.load(input_file)
+                for row in inputs:
+                    row = row[row != END_ID]
+                    input_tokens.append(row)
+            else:
+                print('Input file format not supported.')
+                raise SystemExit
 
-    input_ids = None
-    input_lengths = None
-    if input_file is None:
-        input_ids = torch.tensor(input_tokens, dtype=torch.int32, device='cuda')
-        input_lengths = torch.tensor([input_ids.size(1)],
-                                     dtype=torch.int32,
-                                     device='cuda')
-        max_input_length = torch.max(input_lengths).item()
-    else:
-        input_lengths = torch.tensor([len(x) for x in input_tokens],
-                                     dtype=torch.int32,
-                                     device='cuda')
-        max_input_length = torch.max(input_lengths).item()
-        input_ids = np.full((len(input_lengths), max_input_length), END_ID)
-        for i in range(len(input_lengths)):
-            input_ids[i][-len(input_tokens[i]):] = input_tokens[i]
-        input_ids = torch.tensor(input_ids, dtype=torch.int32, device='cuda')
+        input_ids = None
+        input_lengths = None
+        if input_file is None:
+            input_ids = torch.tensor(input_tokens, dtype=torch.int32, device='cuda')
+            input_lengths = torch.tensor([input_ids.size(1)],
+                                         dtype=torch.int32,
+                                         device='cuda')
+            max_input_length = torch.max(input_lengths).item()
+        else:
+            input_lengths = torch.tensor([len(x) for x in input_tokens],
+                                         dtype=torch.int32,
+                                         device='cuda')
+            max_input_length = torch.max(input_lengths).item()
+            input_ids = np.full((len(input_lengths), max_input_length), END_ID)
+            for i in range(len(input_lengths)):
+                input_ids[i][-len(input_tokens[i]):] = input_tokens[i]
+            input_ids = torch.tensor(input_ids, dtype=torch.int32, device='cuda')
 
-    top_k = 1
-    temperature = 1
-    output_ids = model.generate(input_ids,
-                                max_length=max_input_length + max_output_len,
-                                top_k=top_k,
-                                temperature=temperature,
-                                eos_token_id=END_ID,
-                                pad_token_id=END_ID)
-    torch.cuda.synchronize()
+        top_k = 1
+        temperature = 1
+        output_ids = model.generate(input_ids,
+                                    max_length=max_input_length + max_output_len,
+                                    top_k=top_k,
+                                    top_p=1,
+                                    temperature=temperature,
+                                    do_sample=True,
+                                    eos_token_id=END_ID,
+                                    pad_token_id=END_ID)
 
-    if output_csv is None and output_npy is None:
-        for b in range(input_lengths.size(0)):
-            inputs = input_tokens[b]
-            input_text = tokenizer.decode(inputs)
-            print(f'Input: {input_text}')
-            outputs = output_ids[b][max_input_length:].tolist()
-            output_text = tokenizer.decode(outputs)
-            print(f'Output: {output_text}')
+        if output_csv is None and output_npy is None:
+            for b in range(input_lengths.size(0)):
+                inputs = input_tokens[b]
+                input_text = tokenizer.decode(inputs)
+                # print(f'Input: {input_text}')
+                outputs = output_ids[b][max_input_length:].tolist()
+                output_text = tokenizer.decode(outputs)
+                # print(f'Output: {output_text}')
 
-    if output_csv is not None:
-        output_file = Path(output_csv)
-        output_file.parent.mkdir(exist_ok=True, parents=True)
-        outputs = output_ids[:, max_input_length:].tolist()
-        with open(output_file, 'w') as csv_file:
-            writer = csv.writer(csv_file, delimiter=',')
-            writer.writerows(outputs)
+        if output_csv is not None:
+            output_file = Path(output_csv)
+            output_file.parent.mkdir(exist_ok=True, parents=True)
+            outputs = output_ids[:, max_input_length:].tolist()
+            with open(output_file, 'w') as csv_file:
+                writer = csv.writer(csv_file, delimiter=',')
+                writer.writerows(outputs)
 
-    if output_npy is not None:
-        output_file = Path(output_npy)
-        output_file.parent.mkdir(exist_ok=True, parents=True)
-        outputs = output_ids[:, max_input_length:].tolist()
-        np.save(output_file, np.array(outputs, dtype='int32'))
+        if output_npy is not None:
+            output_file = Path(output_npy)
+            output_file.parent.mkdir(exist_ok=True, parents=True)
+            outputs = output_ids[:, max_input_length:].tolist()
+            np.save(output_file, np.array(outputs, dtype='int32'))
+
+        end = time.time()
+        torch.cuda.synchronize()
+        time_costs.append(end - begin)
+        tokens_count = input_ids.size(1) + output_ids.size(1)
+        speed = (input_ids.size(1) + output_ids.size(1)) / time_costs[-1]
+        print('tokens: {}, time taken: {}s, speed: {} tokens/s'.format(
+            tokens_count, time_costs[-1], speed))
+        if i > 0:
+            speeds.append(speed)
+
+    print('average tokens count: {}'.format(tokens_count))
+    print('average time taken: {}s'.format(np.mean(time_costs)))
+    print('average speed: {} tokens/s'.format(np.mean(speeds)))
+    print(f'Input: {input_text}')
+    print(f'Output: {output_text}')
 
 
 if __name__ == '__main__':
